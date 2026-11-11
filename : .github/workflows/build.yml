@@ -1,0 +1,378 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/example/telegramalarm
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "TelegramAlarm"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.telegramalarm"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.telegramalarm"
+                  minSdk = 27
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+              <application
+                  android:label="Telegram Alarm"
+                  android:icon="@android:drawable/ic_lock_idle_alarm"
+                  android:allowBackup="false">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".TgListener" android:exported="true"
+                      android:label="Telegram Alarm"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService"/>
+                      </intent-filter>
+                  </service>
+                  <receiver android:name=".StopReceiver" android:exported="false"/>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/telegramalarm/Core.kt <<'EOF'
+          package com.example.telegramalarm
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.drawable.Icon
+          import android.media.AudioAttributes
+          import android.media.AudioManager
+          import android.media.MediaPlayer
+          import android.media.RingtoneManager
+          import android.os.PowerManager
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          object Prefs {
+              fun sp(c: Context): SharedPreferences =
+                  c.getSharedPreferences("p", Context.MODE_PRIVATE)
+          }
+
+          object AlarmPlayer {
+              private var player: MediaPlayer? = null
+              private var wl: PowerManager.WakeLock? = null
+              private const val CH = "alarm_ch"
+              private const val NID = 4242
+              var ringing = false
+                  private set
+
+              @Synchronized
+              fun start(ctx: Context) {
+                  if (ringing) return
+                  ringing = true
+                  val c = ctx.applicationContext
+                  val attrs = AudioAttributes.Builder()
+                      .setUsage(AudioAttributes.USAGE_ALARM)
+                      .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                      .build()
+                  try {
+                      val am = c.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      am.setStreamVolume(
+                          AudioManager.STREAM_ALARM,
+                          am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0
+                      )
+                  } catch (e: Exception) {}
+                  for (t in intArrayOf(RingtoneManager.TYPE_RINGTONE, RingtoneManager.TYPE_ALARM)) {
+                      try {
+                          val mp = MediaPlayer()
+                          mp.setAudioAttributes(attrs)
+                          mp.setDataSource(c, RingtoneManager.getDefaultUri(t))
+                          mp.isLooping = true
+                          mp.prepare()
+                          mp.start()
+                          player = mp
+                          break
+                      } catch (e: Exception) {}
+                  }
+                  try {
+                      val v = c.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 800, 600), 0), attrs)
+                  } catch (e: Exception) {}
+                  try {
+                      val pm = c.getSystemService(Context.POWER_SERVICE) as PowerManager
+                      val w = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tga:ring")
+                      w.acquire(60 * 60 * 1000L)
+                      wl = w
+                  } catch (e: Exception) {}
+                  try {
+                      val nm = c.getSystemService(NotificationManager::class.java)
+                      val ch = NotificationChannel(CH, "Alarm", NotificationManager.IMPORTANCE_HIGH)
+                      ch.setSound(null, null)
+                      ch.enableVibration(false)
+                      nm.createNotificationChannel(ch)
+                      val fl = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                      val open = PendingIntent.getActivity(
+                          c, 0,
+                          Intent(c, MainActivity::class.java)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                          fl
+                      )
+                      val stop = PendingIntent.getBroadcast(c, 1, Intent(c, StopReceiver::class.java), fl)
+                      val n = Notification.Builder(c, CH)
+                          .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                          .setContentTitle("رسالة جديدة من الشخص المراقَب")
+                          .setContentText("اضغط لإيقاف الإنذار")
+                          .setCategory(Notification.CATEGORY_ALARM)
+                          .setOngoing(true)
+                          .setContentIntent(open)
+                          .setFullScreenIntent(open, true)
+                          .addAction(
+                              Notification.Action.Builder(
+                                  Icon.createWithResource(c, android.R.drawable.ic_menu_close_clear_cancel),
+                                  "إيقاف الإنذار", stop
+                              ).build()
+                          )
+                          .build()
+                      nm.notify(NID, n)
+                  } catch (e: Exception) {}
+              }
+
+              @Synchronized
+              fun stop(ctx: Context) {
+                  ringing = false
+                  try { player?.stop() } catch (e: Exception) {}
+                  try { player?.release() } catch (e: Exception) {}
+                  player = null
+                  try { (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).cancel() } catch (e: Exception) {}
+                  try { if (wl?.isHeld == true) wl?.release() } catch (e: Exception) {}
+                  wl = null
+                  try { ctx.getSystemService(NotificationManager::class.java).cancel(NID) } catch (e: Exception) {}
+              }
+          }
+
+          class StopReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) { AlarmPlayer.stop(c) }
+          }
+
+          class TgListener : NotificationListenerService() {
+              private val seen = HashMap<String, Int>()
+              private val tg = setOf(
+                  "org.telegram.messenger", "org.telegram.messenger.web",
+                  "org.telegram.plus", "org.thunderdog.challegram"
+              )
+
+              private fun norm(s: String) =
+                  s.replace(Regex("[\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069]"), "")
+                      .trim().replace(Regex("\\s+"), " ").lowercase()
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  try { handle(sbn) } catch (e: Exception) {}
+              }
+
+              private fun handle(sbn: StatusBarNotification) {
+                  if (sbn.packageName !in tg) return
+                  val sp = Prefs.sp(this)
+                  if (!sp.getBoolean("enabled", false)) return
+                  val target = norm(sp.getString("name", "") ?: "")
+                  if (target.isEmpty()) return
+                  val n = sbn.notification
+                  if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+                  val ex = n.extras
+                  val title = norm(ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: "")
+                  if (title != target) return
+                  val text = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+                  val sig = (sbn.key + "|" + n.`when` + "|" + text).hashCode()
+                  if (seen[sbn.key] == sig) return
+                  if (seen.size > 200) seen.clear()
+                  seen[sbn.key] = sig
+                  AlarmPlayer.start(this)
+              }
+
+              override fun onListenerDisconnected() {
+                  try { requestRebind(ComponentName(this, TgListener::class.java)) } catch (e: Exception) {}
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/example/telegramalarm/MainActivity.kt <<'EOF'
+          package com.example.telegramalarm
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var warn: TextView
+              private lateinit var input: EditText
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun btn(root: LinearLayout, t: String, bg: Int, h: Int = 52, f: () -> Unit) {
+                  val b = Button(this)
+                  b.text = t
+                  b.setTextColor(Color.WHITE)
+                  b.setBackgroundColor(bg)
+                  b.setOnClickListener { f(); refresh() }
+                  val lp = LinearLayout.LayoutParams(-1, dp(h))
+                  lp.topMargin = dp(10)
+                  root.addView(b, lp)
+              }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  setShowWhenLocked(true)
+                  setTurnScreenOn(true)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  }
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(20), dp(24), dp(20), dp(24))
+                  root.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  status = TextView(this)
+                  status.textSize = 20f
+                  warn = TextView(this)
+                  warn.textSize = 14f
+                  warn.setTextColor(Color.parseColor("#B71C1C"))
+                  input = EditText(this)
+                  input.hint = "اسم الشخص كما يظهر فإشعار تيليغرام"
+                  input.setSingleLine()
+                  input.setText(Prefs.sp(this).getString("name", ""))
+                  root.addView(status)
+                  root.addView(warn)
+                  root.addView(input)
+
+                  btn(root, "حفظ وتفعيل المراقبة", 0xFF2E7D32.toInt()) {
+                      val n = input.text.toString().trim()
+                      if (n.isEmpty()) {
+                          Toast.makeText(this, "دخل الاسم", Toast.LENGTH_SHORT).show()
+                      } else {
+                          Prefs.sp(this).edit().putString("name", n).putBoolean("enabled", true).apply()
+                      }
+                  }
+                  btn(root, "إيقاف الإنذار", 0xFFC62828.toInt(), 130) { AlarmPlayer.stop(this) }
+                  btn(root, "تعطيل المراقبة", 0xFF616161.toInt()) {
+                      Prefs.sp(this).edit().putBoolean("enabled", false).apply()
+                      AlarmPlayer.stop(this)
+                  }
+                  btn(root, "تجربة الرنة", 0xFF1565C0.toInt()) { AlarmPlayer.start(this) }
+                  btn(root, "1) السماح بقراءة الإشعارات", 0xFF455A64.toInt()) {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }
+                  btn(root, "2) إعفاء من توفير البطارية", 0xFF455A64.toInt()) {
+                      try {
+                          startActivity(
+                              Intent(
+                                  Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                  Uri.parse("package:" + packageName)
+                              )
+                          )
+                      } catch (e: Exception) {
+                          startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                      }
+                  }
+                  btn(root, "3) معلومات التطبيق (الإعدادات المقيدة)", 0xFF455A64.toInt()) {
+                      startActivity(
+                          Intent(
+                              Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                              Uri.parse("package:" + packageName)
+                          )
+                      )
+                  }
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val sp = Prefs.sp(this)
+                  val on = sp.getBoolean("enabled", false)
+                  status.text = if (on) "✅ المراقبة مفعلة لـ «" + sp.getString("name", "") + "»"
+                  else "⛔ المراقبة متوقفة"
+                  val en = Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: ""
+                  warn.text = if (en.contains(packageName)) "" else "⚠️ صلاحية قراءة الإشعارات ما مفعلاش"
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk --title "Build ${{ github.run_number }}" --notes "APK"
